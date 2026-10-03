@@ -1,0 +1,17 @@
+name = "RobustPCA"
+uuid = "12eaa3d9-bbdb-42f9-9e44-84e1dd190ad0"
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SVDScratch = "4d97c398-8ba9-47ce-8350-91d6d16c86e3"
+
+[sources]
+SVDScratch = {path = "../svd_from_scratch"}
+
+[workspace]
+projects = ["test", "scripts"]
+
+[compat]
+julia = "1.13"

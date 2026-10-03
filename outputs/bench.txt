@@ -1,0 +1,7 @@
+highway, 19200×200, BLAS threads = 1, randomized: median of 3 warm runs, exact: 1 warm run
+SVT                  time  iters  rank      alloc   alloc/iter      F1 ‖L-L_exact‖/‖L‖
+exact GR           40.93s     19   102   1711.1MB      90.06MB   0.907        0.0e+00
+randomized w=20     1.07s     19    20      2.9MB       0.15MB   0.908        2.5e-03
+randomized w=40     1.93s     19    34      6.7MB       0.35MB   0.908        1.5e-03
+randomized w=80     5.04s     19    56     16.7MB       0.88MB   0.907        9.0e-04
+live heap after each of 5 solves: 332.3, 332.3, 332.3, 332.3, 332.3 MB
