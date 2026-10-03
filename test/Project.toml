@@ -7,4 +7,4 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 RobustPCA = {path = ".."}
-SVDScratch = {path = "../../svd_from_scratch"}
+SVDScratch = {url = "https://github.com/Spidy104/svd_from_scratch", rev = "bcc9f91e9aee7b7bae5009956d2401b8e40ebd6a"}

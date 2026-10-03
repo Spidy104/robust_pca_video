@@ -84,9 +84,14 @@ function rpca!(ws::RPCAWorkspace, X::AbstractMatrix{Float64};
     size(X) == size(ws.L) || throw(DimensionMismatch("workspace does not match X"))
     max_iter <= length(ws.rank) || throw(ArgumentError("max_iter exceeds workspace history"))
     (; L, S, Y, T) = ws
+    normF = norm(X)
+    if iszero(normF)                        # X = 0 is solved by L = S = 0; μ = 1.25/‖X‖₂ would be Inf
+        fill!(L, 0.0)
+        fill!(S, 0.0)
+        return 0
+    end
     Random.seed!(ws.rng, seed)
     norm2 = spectral_norm!(ws, X)
-    normF = norm(X)
     μ = 1.25 / norm2
     μ_max = 1e7 * μ
     Y .= X ./ max(norm2, maximum(abs, X) / λ)
@@ -178,14 +183,16 @@ function step!(o::OnlineRPCA, s::AbstractVector{Float64}, x::AbstractVector{Floa
     @inbounds for k in 1:r, i in axes(B, 1)
         B[i, k] = γ * B[i, k] + (x[i] - s[i]) * v[k]
     end
+    # Exact minimizer of ½tr(Uᵀ(A + λ₁I)U) − tr(UᵀB) over column j, the others fixed:
+    # uⱼ ← uⱼ + (bⱼ − U ãⱼ)/Ãⱼⱼ with Ã = A + λ₁I (Feng, Xu & Yan 2013, Algorithm 2).
     @inbounds for j in 1:r
         scale = 1 / (A[j, j] + λ₁)
         for i in axes(U, 1)
-            Ua = 0.0
+            Ua = λ₁ * U[i, j]
             for k in 1:r
                 Ua += U[i, k] * A[k, j]
             end
-            U[i, j] += (B[i, j] - Ua) * scale       # uⱼ ← uⱼ + (bⱼ − U aⱼ)/(Aⱼⱼ + λ₁)
+            U[i, j] += (B[i, j] - Ua) * scale
         end
     end
     s

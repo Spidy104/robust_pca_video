@@ -1,57 +1,56 @@
-# Robust PCA video background separation
+# robust_pca_video
 
-Splits a fixed-camera video into a low-rank background `L` and a sparse foreground `S` by principal component pursuit,
-
-```
-min ‖L‖_* + λ‖S‖₁   subject to   L + S = X,      λ = 1/√max(m, n)
-```
-
-with each grayscale frame as one column of `X`. It's solved with the inexact augmented Lagrange multiplier method (Lin, Chen & Ma 2010). Each iteration does singular value thresholding on the background and soft thresholding on the foreground. The SVT step uses the randomized range finder and the Golub–Reinsch SVD from [`svd_from_scratch`](../svd_from_scratch), and only a small w×n core is decomposed exactly.
-
-A second solver, **online RPCA** (OR-PCA, Feng, Xu & Yan 2013), processes one frame at a time. It uses the factored form ‖L‖_* = min ½(‖U‖²_F + ‖V‖²_F), so each frame `x` only needs a small problem
+Background subtraction for fixed-camera video with robust PCA, written in Julia from the
+equations up. The video is a matrix `X` with one grayscale frame per column. Robust PCA
+splits it into a low-rank part `L` (the background) and a sparse part `S` (whatever moves):
 
 ```
-min_{v,s} ½‖x − Uv − s‖² + λ₁/2 ‖v‖² + λ₂‖s‖₁        λ₁ = λ₂ = 1/√m
+minimize  ‖L‖_* + λ‖S‖₁   subject to   L + S = X,      λ = 1/√max(m, n)
 ```
 
-solved by alternating a ridge solve `v = (UᵀU + λ₁I)⁻¹Uᵀ(x − s)` and a soft threshold `s = shrink(x − Uv, λ₂)`. The basis `U` (m×5) is then refit by one sweep of block coordinate descent on the discounted sums `A = Σγᵏvvᵀ` and `B = Σγᵏ(x − s)vᵀ`. Its memory is ~1/(1 − γ) frames (γ = 0.999). It is warm-started from the batch solve of the first window.
+There are two solvers:
 
-Everything is scored against CDnet 2014 pixel-level ground truth.
+- **Batch.** Inexact augmented Lagrange multipliers (Lin, Chen & Ma 2010) on 200-frame windows. Each iteration does one singular value thresholding step and one soft thresholding step. The SVT uses the randomized range finder and Golub–Reinsch SVD from my [svd_from_scratch](https://github.com/Spidy104/svd_from_scratch), so only a small w×200 matrix is ever decomposed exactly.
+- **Online.** OR-PCA (Feng, Xu & Yan 2013), one frame at a time, with a rank-5 background basis and a forgetting factor.
 
-## Run
+Both are scored on five CDnet 2014 videos (11,334 frames) against the per-pixel ground truth, next to a plain temporal median as the baseline.
 
-Julia 1.13, ffmpeg, curl. Standard library plus `SVDScratch` (path dependency) only.
+## Running it
+
+Needs Julia 1.13, ffmpeg and curl. The only non-stdlib dependency is SVDScratch, which Pkg fetches from GitHub at a pinned commit.
 
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=test test/runtests.jl
 
-scripts/fetch_cdnet.sh baseline highway              # streams one video, 3.5 min at ~3 MB/s
-julia --project=scripts scripts/run.jl cdnet highway   # all four methods over the full video; mosaic mp4/png
-julia --project=scripts scripts/run.jl summary         # calibrate τ on highway, score every video
-julia --project=scripts scripts/run.jl sweep           # online γ and λ₂ sensitivity
-julia --project=scripts scripts/run.jl render boats 5500   # batch vs online around a given frame
+scripts/fetch_cdnet.sh baseline highway              # ~3.5 min at 3 MB/s
+scripts/fetch_cdnet.sh shadow backdoor
+scripts/fetch_cdnet.sh dynamicBackground boats
+scripts/fetch_cdnet.sh cameraJitter badminton
+scripts/fetch_cdnet.sh intermittentObjectMotion abandonedBox
+
+julia --project=scripts scripts/run.jl cdnet highway   # run highway first: it calibrates the thresholds
+julia --project=scripts scripts/run.jl cdnet backdoor  # ...and the other four
+julia --project=scripts scripts/run.jl summary         # outputs/summary.md
+julia --project=scripts scripts/run.jl sweep           # online γ / λ₂ sensitivity
+julia --project=scripts scripts/run.jl render boats 5500
 julia --project=scripts scripts/run.jl bench           # exact vs randomized SVT
-julia --project=scripts scripts/run.jl synthetic       # recovery phase grid
+julia --project=scripts scripts/run.jl synthetic       # recovery on random problems
 ```
 
-`fetch_cdnet.sh <category> <video> [offset=0] [frames=all] [width=160]` pulls from the Hugging Face mirror
-[`tauseefakhund/D2-CDNet`](https://huggingface.co/datasets/tauseefakhund/D2-CDNet), because the original changedetection.net host no longer resolves. It extracts the video's input frames, ground truth and temporal ROI, and stops downloading once the tar stream moves past the video. ffmpeg then writes the whole temporal ROI (or `frames` of it, from `offset`) as raw 8-bit luma (BT.601, area-averaged to 160 px wide) and the labels with nearest-neighbour scaling, so the label values survive.
+changedetection.net, the original CDnet host, no longer resolves, so `fetch_cdnet.sh` streams the category tarballs from the Hugging Face mirror [tauseefakhund/D2-CDNet](https://huggingface.co/datasets/tauseefakhund/D2-CDNet). It keeps one video and hangs up once the stream has moved past it. ffmpeg then converts the temporal ROI to raw 8-bit luma at 160 px wide. The ground-truth masks are resized with nearest neighbour so the label values survive.
 
-## Layout
+## Code
 
-`src/RobustPCA.jl` holds the whole package: the workspace, `soft`, `svt!`/`svt_exact!`, `rpca!`, `OnlineRPCA`/`step!`, the temporal-median baseline (Wirth's selection), a separable box filter, PR/F1 against CDnet labels, and raw video I/O. `scripts/run.jl` runs the experiments, `test/runtests.jl` the tests, and `outputs/` holds the saved results.
+`src/RobustPCA.jl` (about 330 lines) is the whole package: the batch and online solvers, SVT, soft thresholding, the median baseline (Wirth's selection), a separable box filter, PR counting against CDnet labels, and raw video I/O. `scripts/run.jl` runs every experiment in this file and `test/runtests.jl` has the tests.
 
-## Memory
-
-Every m×n buffer (`L, S, Y, T`, the range-finder `Q`, the w×n core) is allocated once in `RPCAWorkspace`. The only allocation inside an iteration is the exact SVD of the small w×n core (0.15 MB/iteration at w = 20). Online RPCA allocates once, in `OnlineRPCA`; `step!` allocates nothing per frame. The tests check that the broadcast updates, the range finder, `step!`, the median, the box filter and the PR tally allocate 0 bytes. The live heap stays flat across repeated solves.
+All large buffers are allocated once. Inside a batch iteration the only allocation is the SVD of the small w×200 core, about 0.15 MB at w = 20. The online `step!` allocates nothing, and neither do the range finder, the median, the box filter or the PR tally; the tests check all of these with `@allocated`. Repeated solves leave the live heap flat.
 
 ## Results
 
-### Synthetic exact recovery (`outputs/synthetic.csv`)
+### Synthetic recovery
 
-4800×200, `L0` of rank r with Gaussian factors, `S0` of ±1 at random positions, tol 1e-7, w = 60.
-Recovery is exact, to the 1e-7 tolerance, below the phase transition and breaks down past it, as the theory predicts:
+4800×200 problems: `L0` of rank r with Gaussian factors, plus `S0` with ±1 at random positions. Batch solver, tolerance 1e-7. The table gives ‖L − L0‖/‖L0‖.
 
 | rank \ density | 0.02 | 0.05 | 0.10 | 0.20 | 0.30 |
 |---|---|---|---|---|---|
@@ -61,84 +60,58 @@ Recovery is exact, to the 1e-7 tolerance, below the phase transition and breaks 
 | 30 | 2e-7 | 2e-7 | 2e-3 | 3e-2 | 0.15 |
 | 40 | 7e-4 | 3e-3 | 1e-2 | 0.11 | 0.30 |
 
-(relative error ‖L − L0‖/‖L0‖)
+Recovery is exact up to the tolerance until rank and density get too large, as the theory says it should be.
 
-### Exact vs randomized SVT on real frames (`outputs/bench.txt`)
+### Exact vs randomized SVT
 
-CDnet highway, 160×120 × 200 frames (19200×200), tol 1e-3, one BLAS thread:
+One 200-frame window of highway (19200×200), tolerance 1e-3, one BLAS thread, on an i5-1335U:
 
-| SVT | time | iterations | rank(L) | allocated | F1 | ‖L − L_exact‖/‖L‖ |
-|---|---:|---:|---:|---:|---:|---:|
-| exact Golub–Reinsch | 41.95 s | 19 | 102 | 1711 MB | 0.907 | — |
-| randomized, w = 20 | **1.07 s** | 19 | 20 | **2.9 MB** | 0.908 | 2.5e-3 |
-| randomized, w = 40 | 1.94 s | 19 | 34 | 6.7 MB | 0.908 | 1.5e-3 |
-| randomized, w = 80 | 5.03 s | 19 | 56 | 16.7 MB | 0.907 | 9.0e-4 |
+| SVT | time | rank(L) | allocated | F1 | ‖L − L_exact‖/‖L‖ |
+|---|---:|---:|---:|---:|---:|
+| exact Golub–Reinsch | 40.93 s | 102 | 1711 MB | 0.907 | |
+| randomized, w = 20 | 1.07 s | 20 | 2.9 MB | 0.908 | 2.5e-3 |
+| randomized, w = 40 | 1.93 s | 34 | 6.7 MB | 0.908 | 1.5e-3 |
+| randomized, w = 80 | 5.04 s | 56 | 16.7 MB | 0.907 | 9.0e-4 |
 
-The randomized SVT is 39× faster with the same F1 on this window. The exact solver lets sensor noise into `L` once `1/μ` becomes small, and the width cap leaves it out. The width is not only a speed knob, though: it caps rank(L), which matters on other videos (see below).
+Same F1, about 38× faster. Measured separately, a single 19200×200 SVD takes 70 ms randomized (w = 40), 259 ms with LAPACK and 2.15 s with the exact Golub–Reinsch. The exact one agrees with LAPACK to 7e-14.
 
-A single 19200×200 SVD, measured separately: 70 ms randomized (w = 40), 259 ms LAPACK, 2151 ms our exact Golub–Reinsch. Exact Golub–Reinsch agrees with LAPACK to 7e-14.
+The width w is more than a speed setting, because it caps the rank of `L`. That matters later.
 
-### Choices made from measurements
+### CDnet 2014
 
-On highway:
-- **λ = 1/√m is the best of {0.5, 1, 2}×** (F1 0.834 / 0.861 / 0.821, before smoothing).
-- **Tolerance 1e-3 instead of 1e-7** halves the iterations (39 → 19) with identical F1, so video runs use 1e-3. Tests and the synthetic grid keep 1e-7.
-- **A 3×3 box filter on |S| before thresholding** raises F1 from 0.861 to 0.908, because it fills the hollow interiors of flat-coloured cars. Radius 2 and 3 were worse. The median baseline gets the same treatment.
+The protocol is meant to keep the numbers honest. Every frame of each video's temporal ROI is scored. Each method gets a single threshold on its (3×3 box-smoothed) residual, chosen on highway and then used unchanged on the other four videos. Next to it is the oracle F1, the best threshold for that video picked with its own ground truth, which shows how much the fixed threshold costs. Shadow pixels count as background; outside-ROI and unknown pixels are skipped.
 
-### CDnet 2014, full videos, threshold calibrated on one video
+Each cell is oracle F1 / F1 at the highway threshold.
 
-Protocol:
-- Every video is scored over its whole temporal ROI (11,334 frames in total) at 160 px wide. Batch RPCA solves consecutive 200-frame windows. Online RPCA sees each frame once, in order.
-- Each method gets one threshold τ, chosen as the best F1 on **highway only**, then applied unchanged to the other four videos. The "oracle" number (best τ per video, using that video's ground truth) is shown alongside only to measure how well τ transfers.
-- Every method scores the 3×3 box-smoothed |residual|.
-- Ground truth: shadow pixels count as background; outside-ROI and unknown pixels are ignored.
-
-Cells: oracle F1 / **F1 at the calibrated τ** (precision, recall). From `outputs/summary.md`:
-
-| video | frames | stress | batch RPCA w=5 | batch RPCA w=20 | online RPCA | temporal median |
+| video | frames | difficulty | batch w=5 | batch w=20 | online | median |
 |---|---:|---|---:|---:|---:|---:|
-| highway (calibration) | 1231 | none | 0.904 / **0.904** (P 0.86, R 0.95) | 0.899 / **0.899** (P 0.86, R 0.95) | 0.908 / **0.908** (P 0.87, R 0.95) | 0.909 / **0.909** (P 0.87, R 0.95) |
-| backdoor | 1601 | shadows | 0.938 / **0.933** (P 0.96, R 0.91) | 0.946 / **0.944** (P 0.96, R 0.93) | 0.790 / **0.774** (P 0.68, R 0.90) | 0.872 / **0.843** (P 0.79, R 0.90) |
-| badminton | 351 | camera shake | 0.785 / **0.784** (P 0.81, R 0.76) | 0.800 / **0.800** (P 0.81, R 0.79) | 0.861 / **0.861** (P 0.87, R 0.85) | 0.726 / **0.665** (P 0.57, R 0.80) |
-| abandonedBox | 2051 | objects that stop | 0.462 / **0.462** (P 0.62, R 0.37) | 0.456 / **0.456** (P 0.61, R 0.37) | 0.747 / **0.520** (P 0.35, R 0.98) | 0.491 / **0.450** (P 0.53, R 0.39) |
-| boats | 6100 | rippling water | 0.423 / **0.147** (P 0.09, R 0.50) | 0.357 / **0.162** (P 0.10, R 0.39) | 0.729 / **0.193** (P 0.11, R 0.88) | 0.544 / **0.182** (P 0.10, R 0.70) |
+| highway | 1231 | none (calibration) | 0.904 / 0.904 | 0.899 / 0.899 | 0.908 / 0.908 | 0.909 / 0.909 |
+| backdoor | 1601 | shadows | 0.938 / 0.933 | 0.946 / 0.944 | 0.790 / 0.774 | 0.872 / 0.843 |
+| badminton | 351 | camera shake | 0.785 / 0.784 | 0.800 / 0.800 | 0.861 / 0.861 | 0.726 / 0.665 |
+| abandonedBox | 2051 | objects that stop | 0.462 / 0.462 | 0.456 / 0.456 | 0.747 / 0.520 | 0.491 / 0.450 |
+| boats | 6100 | water, slow sailboat | 0.423 / 0.147 | 0.357 / 0.162 | 0.729 / 0.193 | 0.544 / 0.182 |
 
-Calibrated τ: batch 0.080 (w=5), 0.065 (w=20); online 0.080; median 0.085. Speed: batch 113–293 frames/s (19 iterations per window), online 284–514 frames/s. The temporal median takes 22 ms per window.
+Precision and recall for every cell are in `outputs/summary.md`. Batch runs at roughly 100–300 frames/s and online at 160–450 frames/s. The median takes 22 ms per window.
 
-What the table says:
-- **Batch RPCA's threshold transfers; the median's doesn't.** At the highway τ, batch RPCA loses at most 0.005 F1 against its per-video oracle on backdoor, badminton and abandonedBox. On those same three videos the median loses 0.03–0.06, because its residual's scale changes with the scene.
-- **Batch RPCA wins clearly where the background varies within a window:** shadows (0.944 vs 0.843) and camera shake (0.800 vs 0.665).
-- **Online RPCA fixes the two failures batch RPCA can't:** objects that stop (oracle 0.747 vs 0.46) and the slow sailboat on boats (oracle 0.729 vs 0.36–0.42). It is also the best on camera shake (0.861), because its basis is fit over the whole video rather than 200 frames.
-- **Online RPCA's weakness is drift.** It only learns the background from `x − s`, so any lasting change to the scene stays foreground. On backdoor its false-positive rate climbs from 0 to 1.6% over the video, and calibrated F1 falls to 0.774, below even the median. The same mechanism costs it precision on abandonedBox at the highway τ (0.35).
-- **Boats is bad for everyone at a transferred τ.** 4,800 of its 6,100 frames contain no labelled motion, only rippling water, so every detection there is a false alarm.
+No method wins everywhere.
 
-### Batch vs online, side by side
+Batch RPCA is best when the background changes within a window: shadows (0.944 against the median's 0.843) and camera shake. Its threshold also transfers. On backdoor, badminton and abandonedBox the highway threshold costs it at most 0.005 F1, while the median loses 0.03 to 0.06 because the scale of its residual changes from scene to scene.
 
-`render <video> [frame]` writes `outputs/<video>[_frame].png` and `.mp4`. Top row: batch w=5; bottom row: online. Panels: input | `L` | 4·|S| | mask at the calibrated τ | ground truth (white = motion, grey = shadow, dark = ignored).
+Online RPCA fixes the two cases batch can't handle. A box that is left standing becomes part of a batch window's low-rank background, so batch scores 0.46 on abandonedBox. Online remembers the scene from before the box arrived and scores 0.75. A sailboat drifting slowly across boats leaves a ghost in the batch background, while online keeps it in the foreground. Online is also the best of the four on camera shake.
 
-- `outputs/abandonedBox_1100.png`: the box has stood still for hundreds of frames. Batch has it in `L` and an empty mask there; online keeps it as foreground.
-- `outputs/boats_5500.png`: batch's `L` contains a ghost of the slowly drifting sailboat; online's `L` is clean water and its mask covers the whole boat.
-- `outputs/backdoor.png`: online's false positives at the left edge, where the scene changed after the warm start.
+Online pays for this with drift. It learns the background only from `x − s`, so a lasting change to the scene is treated as foreground for a long time. On backdoor its false positive rate climbs from 0 to 1.6% over the video, and it ends up below the median.
 
-### Online RPCA settings (`outputs/online_sweep.md`)
+Boats is bad for everyone once the threshold is fixed. 4,800 of its frames have nothing labelled in them, just rippling water, so any detection there is a false positive.
 
-γ and λ₂ were fixed at 0.999 and 1/√m before testing. The sweep is reported, not used to pick them. Each row gets its own τ calibrated on highway. Cells: calibrated F1 (oracle F1).
+To see the difference, run `render <video> [frame]`. It writes an image and a 200-frame clip with batch on the top row and online below. The columns are input, `L`, 4·|S|, mask and ground truth.
 
-| γ | λ₂·√m | highway | backdoor | boats | badminton | abandonedBox |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0.99 | 1 | 0.904 (0.904) | 0.868 (0.868) | 0.218 (0.714) | 0.862 (0.862) | 0.651 (0.684) |
-| 0.995 | 1 | 0.909 (0.909) | 0.826 (0.827) | 0.208 (0.713) | 0.861 (0.861) | 0.601 (0.703) |
-| **0.999** | **1** | 0.908 (0.908) | 0.774 (0.790) | 0.193 (0.729) | 0.861 (0.861) | 0.520 (0.747) |
-| 1.0 | 1 | 0.907 (0.907) | 0.788 (0.794) | 0.169 (0.710) | 0.861 (0.861) | 0.499 (0.761) |
-| 0.999 | 0.5 | 0.908 (0.908) | 0.791 (0.796) | 0.184 (0.715) | 0.861 (0.861) | 0.497 (0.761) |
-| 0.999 | 2 | 0.907 (0.907) | 0.784 (0.796) | 0.220 (0.731) | 0.860 (0.861) | 0.565 (0.714) |
-| 0.999 | 4 | 0.898 (0.898) | 0.836 (0.839) | 0.208 (0.728) | 0.858 (0.858) | 0.575 (0.690) |
+- `outputs/abandonedBox_1100.png`: the box has been standing for hundreds of frames. Batch has absorbed it, online still marks it.
+- `outputs/boats_5500.png`: the sailboat is ghosted into the batch background but sits cleanly in the online foreground.
+- `outputs/backdoor.png`: online false positives on the left, where the scene changed after the start.
 
-This is the stability–plasticity tradeoff in numbers. Shorter memory (γ = 0.99) or a faster foreground leak (larger λ₂) absorbs scene changes sooner: backdoor improves to 0.868 and calibrated abandonedBox to 0.651. But the box is also absorbed sooner, so abandonedBox's oracle falls (0.761 → 0.684). Highway, the calibration video, scores 0.898–0.909 for every setting, so it cannot pick between them. Choosing γ per video would mean tuning on test ground truth.
+### Rank cap (batch)
 
-### The rank cap is a modelling choice
-
-On boats' last 1,000 frames a sailboat drifts slowly across. With up to 20 components, `L` can follow slow motion, so the boat ends up in the background: the worst window scores F1 0.20 at w = 20 and 0.50 at w = 2. A low cap hurts the other way on camera shake, where the background genuinely needs more modes:
+Oracle F1 for single 200-frame windows:
 
 | w | 2 | 3 | 5 | 10 | 20 |
 |---|---:|---:|---:|---:|---:|
@@ -146,27 +119,46 @@ On boats' last 1,000 frames a sailboat drifts slowly across. With up to 20 compo
 | badminton, frames 1–200 | 0.78 | 0.82 | 0.85 | 0.87 | 0.87 |
 | highway, frames 1–200 | 0.91 | 0.91 | 0.91 | 0.91 | 0.91 |
 
-(oracle F1 per window). Both caps are reported above rather than picking one per video with the test ground truth.
+With a high cap, `L` can follow the slow sailboat. With a low cap, it can't follow the camera shake. Highway doesn't care. Both w = 5 and w = 20 are reported above instead of choosing a width per video with test labels.
 
-### Tried and dropped
+### Online settings
 
-- **Adaptive threshold τ = c·σ̂**, with σ̂ the median-absolute-deviation noise level of each window's score and c calibrated on highway. It never beat the fixed τ for RPCA and collapsed on boats (recall ≤ 0.02). For the median it gained on boats (0.45) but lost badly on backdoor (0.69). It was removed.
-- **400-frame windows** on boats' sailboat stretch helped both methods (RPCA 0.47 → 0.55 at w = 5), but the median more (0.57 → 0.71).
+γ = 0.999 and λ₂ = 1/√m were fixed before any results came in. This sweep shows how sensitive the method is to them; it was not used to choose them. Each row gets its own highway-calibrated threshold. Cells are calibrated F1 (oracle F1).
 
-## What fails and why
+| γ | λ₂·√m | highway | backdoor | boats | badminton | abandonedBox |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.99 | 1 | 0.904 (0.904) | 0.868 (0.868) | 0.217 (0.701) | 0.862 (0.862) | 0.645 (0.682) |
+| 0.995 | 1 | 0.909 (0.909) | 0.826 (0.827) | 0.209 (0.726) | 0.861 (0.861) | 0.601 (0.702) |
+| 0.999 | 1 | 0.908 (0.908) | 0.774 (0.790) | 0.193 (0.729) | 0.861 (0.861) | 0.520 (0.747) |
+| 1.0 | 1 | 0.907 (0.907) | 0.788 (0.794) | 0.169 (0.710) | 0.861 (0.861) | 0.499 (0.761) |
+| 0.999 | 0.5 | 0.908 (0.908) | 0.790 (0.796) | 0.184 (0.715) | 0.861 (0.861) | 0.497 (0.761) |
+| 0.999 | 2 | 0.907 (0.907) | 0.784 (0.796) | 0.220 (0.731) | 0.860 (0.861) | 0.565 (0.714) |
+| 0.999 | 4 | 0.898 (0.898) | 0.836 (0.839) | 0.208 (0.728) | 0.858 (0.858) | 0.575 (0.690) |
 
-- **Batch: objects that stop moving get absorbed into the background.** When abandonedBox's box stands still for a whole window, it is rank one, so it goes into `L`, and F1 on that stretch is about 0.04. The median fails the same way. Online RPCA fixes this, because it remembers the background from before the box arrived.
-- **Batch: slow or large objects aren't sparse within a window.** A drifting sailboat or a tram is cheaper to explain as a low-rank change, so it leaves a ghost in `L`. Online RPCA fixes the sailboat.
-- **Online: lasting scene changes stay foreground (drift).** The model learns only from `x − s`, a ±λ₂ sliver of anything it calls foreground, so a real change to the scene is absorbed slowly or not at all. A shorter memory trades this against forgetting stopped objects sooner (see the sweep). Telling "stopped object" apart from "changed scene" needs information neither model has, such as object identity or a rule like "absorb after T frames".
-- **Online: per-frame lasso bias.** Each frame's `s` is shrunk by λ₂ and nothing removes that bias, unlike batch IALM where μ → ∞. On synthetic data the background error is 1.9e-3 (∝ λ₂), against 1e-7 for batch.
-- **False alarms in empty scenes.** Both RPCA variants explain part of every frame as `S`. On thousands of frames of moving water with nothing labelled, those residuals become false positives. A detector meant for deployment would need a scene-level "is anything there" test or temporal persistence; neither is attempted here.
-- **On a clean static scene, RPCA buys nothing.** On highway the 22 ms median matches every RPCA variant.
-- **Flat object interiors look like background** at each pixel, which is why the 3×3 box filter is there. Larger radii smear the edges and lower F1.
+Shorter memory absorbs scene changes faster, which helps backdoor (0.868 at γ = 0.99), but it also absorbs the stopped box faster (abandonedBox oracle 0.761 → 0.682). Highway scores almost the same for every setting, so the calibration video can't choose between them.
+
+## Things that were tried
+
+Some choices came from measurements on highway. λ = 1/√m beat 0.5× and 2× (0.861 against 0.834 and 0.821). Loosening the tolerance from 1e-7 to 1e-3 halved the iterations with no change in F1. A 3×3 box filter on |S| before thresholding filled in the hollow interiors of flat cars and lifted F1 from 0.861 to 0.908; larger filters smeared the edges.
+
+Some ideas didn't work and were removed. An adaptive threshold at c times a MAD noise estimate per window never beat the fixed threshold for RPCA and fell apart on boats. Windows of 400 frames helped on the sailboat stretch, but they helped the median more than RPCA.
+
+## Limitations
+
+A batch window treats anything that stays still as background, so it can't keep a stopped object. Online keeps the object but also keeps every lasting scene change. Telling those two apart needs information that neither model has, such as object identity or a rule like "absorb after N frames".
+
+Online RPCA shrinks each frame's foreground by λ₂, and nothing undoes that shrinkage. On the synthetic stream used in the tests this gives a background error of 1.9e-3, which halves when λ₂ is halved. Batch IALM reaches 1e-7 on the same kind of problem because its shrinkage disappears as μ grows.
+
+Neither RPCA variant ever says that a frame contains nothing, so long empty stretches of moving water produce false positives. A deployed detector would need a scene-level test or temporal persistence.
+
+On a clean static scene like highway, the 22 ms temporal median is as good as any of this.
 
 ## References
 
-- E. Candès, X. Li, Y. Ma, J. Wright, *Robust principal component analysis?*, J. ACM 58(3), 2011.
-- Z. Lin, M. Chen, Y. Ma, *The augmented Lagrange multiplier method for exact recovery of corrupted low-rank matrices*, arXiv:1009.5055, 2010.
-- J. Feng, H. Xu, S. Yan, *Online robust PCA via stochastic optimization*, NeurIPS 2013.
-- N. Halko, P.-G. Martinsson, J. Tropp, *Finding structure with randomness*, SIAM Review 53(2), 2011.
-- Y. Wang et al., *CDnet 2014: An expanded change detection benchmark dataset*, CVPR Workshops, 2014.
+- E. Candès, X. Li, Y. Ma, J. Wright. Robust principal component analysis? J. ACM 58(3), 2011.
+- Z. Lin, M. Chen, Y. Ma. The augmented Lagrange multiplier method for exact recovery of corrupted low-rank matrices. arXiv:1009.5055, 2010.
+- J. Feng, H. Xu, S. Yan. Online robust PCA via stochastic optimization. NeurIPS 2013.
+- N. Halko, P.-G. Martinsson, J. Tropp. Finding structure with randomness. SIAM Review 53(2), 2011.
+- Y. Wang et al. CDnet 2014: An expanded change detection benchmark dataset. CVPR Workshops, 2014.
+
+The frames under `outputs/` come from CDnet 2014. Please cite the paper above if you use them.

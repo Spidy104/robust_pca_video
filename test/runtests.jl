@@ -171,3 +171,36 @@ end
     end
     @test sum(abs, view(s, 1:200)) / sum(abs, box) > 0.9
 end
+
+@testset "online basis update is the exact coordinate minimizer" begin
+    # One coordinate: min ½u²(A + λ₁) − uB with A = B = 2, λ₁ = 1 gives u = 2/3.
+    # With x = s = 0 the frame adds nothing (v = 0), so step! performs exactly that update.
+    o = OnlineRPCA(RPCAWorkspace(1, 2; width=1), 1; λ₁=1.0, γ=1.0)
+    o.U .= 1.0; o.A .= 2.0; o.B .= 2.0
+    step!(o, zeros(1), zeros(1))
+    @test o.U[1, 1] ≈ 2 / 3
+
+    # Several columns: one sweep of the column updates is Gauss–Seidel on U(A + λ₁I) = B,
+    # so repeated sweeps converge to B(A + λ₁I)⁻¹.
+    rng = Xoshiro(8)
+    m, r, λ₁ = 50, 3, 0.3
+    o = OnlineRPCA(RPCAWorkspace(m, 10; width=r), r; λ₁, γ=1.0)
+    F = randn(rng, r, r)
+    o.A .= F * F' + I
+    o.B .= randn(rng, m, r)
+    o.U .= randn(rng, m, r)
+    for _ in 1:200
+        step!(o, zeros(m), zeros(m))
+    end
+    @test o.U ≈ o.B / (o.A + λ₁ * I)
+end
+
+@testset "zero input" begin
+    ws = RPCAWorkspace(30, 10; width=4)
+    @test rpca!(ws, zeros(30, 10)) == 0
+    @test iszero(ws.L) && iszero(ws.S)
+    o = OnlineRPCA(ws, 2)
+    s = ones(30)
+    step!(o, s, zeros(30))
+    @test iszero(s) && all(isfinite, o.U)
+end

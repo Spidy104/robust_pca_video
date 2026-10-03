@@ -2,7 +2,7 @@
 
 julia_version = "1.13.1"
 manifest_format = "2.1"
-project_hash = "ce6cf5d2343b113c73f6b73d886dc55976ebd24d"
+project_hash = "e546ed7a64818f780d63aae8eef4fcaf53ff19f9"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -72,7 +72,9 @@ version = "1.0.0"
 
 [[deps.SVDScratch]]
 deps = ["LinearAlgebra", "Random"]
-path = "../svd_from_scratch"
+git-tree-sha1 = "8eaefc1bcb2acf9d21a9affd9923ffa10ebef3b9"
+repo-rev = "bcc9f91e9aee7b7bae5009956d2401b8e40ebd6a"
+repo-url = "https://github.com/Spidy104/svd_from_scratch"
 uuid = "4d97c398-8ba9-47ce-8350-91d6d16c86e3"
 version = "0.1.0"
 

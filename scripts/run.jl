@@ -79,7 +79,7 @@ function evaluate(video; γ=GAMMA, path=counts_path(video))
             seconds[k] += @elapsed rpca!(ws, X; tol=TOL)
             copy!(d.residual, ws.S)
         end
-        online = something(online, OnlineRPCA(batch[1], RANK; γ))
+        isnothing(online) && (online = OnlineRPCA(batch[1], RANK; γ))   # once, from the first window
         seconds[3] += @elapsed for j in new
             step!(online, view(detectors.online.residual, :, j), view(X, :, j))
         end

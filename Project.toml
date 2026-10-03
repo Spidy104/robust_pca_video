@@ -8,7 +8,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SVDScratch = "4d97c398-8ba9-47ce-8350-91d6d16c86e3"
 
 [sources]
-SVDScratch = {path = "../svd_from_scratch"}
+SVDScratch = {url = "https://github.com/Spidy104/svd_from_scratch", rev = "bcc9f91e9aee7b7bae5009956d2401b8e40ebd6a"}
 
 [workspace]
 projects = ["test", "scripts"]
