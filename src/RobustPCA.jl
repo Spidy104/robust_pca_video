@@ -4,205 +4,227 @@ using LinearAlgebra
 using Random
 using SVDScratch: RandomizedWorkspace, golub_reinsch_svd, randomized_range!
 
-export RPCAWorkspace, rpca!, svt!, svt_exact!, OnlineRPCA, step!, soft, synthetic, median_background!, box_filter!,
-       PRCounts, tally!, pr_curve, read_video
+export RPCAWorkspace, PCPOptions, rpca!, svt!, svt_exact!
+export OnlineRPCA, OnlineOptions, step!
+export PRCounts, Smoother, smooth!, tally!, pr_curve, thresholds
+export soft, synthetic, median_background!, read_video
 
-"""
-Buffers for principal component pursuit on an `m × n` data matrix, allocated once.
-`range` holds the randomized range finder (`Q`: m×w, `B = QᵀT`: w×n) and `C` the
-thresholded w×n core, so `L = Q*C` without ever forming the m×w singular vectors.
-"""
+soft(x, τ) = copysign(max(abs(x) - τ, zero(x)), x)
+
 struct RPCAWorkspace
     L::Matrix{Float64}
     S::Matrix{Float64}
     Y::Matrix{Float64}
     T::Matrix{Float64}
-    range::RandomizedWorkspace{Float64}
-    C::Matrix{Float64}
+    sketch::RandomizedWorkspace{Float64}
+    core::Matrix{Float64}
     rng::Xoshiro
-    rank::Vector{Int}
-    residual::Vector{Float64}
 end
 
-function RPCAWorkspace(m::Integer, n::Integer; width::Integer=40, max_iter::Integer=100)
+function RPCAWorkspace(m::Integer, n::Integer, width::Integer)
     1 <= width <= min(m, n) || throw(ArgumentError("width must be in 1:min(m, n)"))
-    matrix() = zeros(m, n)
-    range = RandomizedWorkspace(Matrix{Float64}(undef, m, width), Matrix{Float64}(undef, n, width), Matrix{Float64}(undef, width, n))
-    RPCAWorkspace(matrix(), matrix(), matrix(), matrix(), range, zeros(width, n), Xoshiro(), zeros(Int, max_iter), zeros(max_iter))
+    sketch = RandomizedWorkspace(Matrix{Float64}(undef, m, width), Matrix{Float64}(undef, n, width), Matrix{Float64}(undef, width, n))
+    RPCAWorkspace(zeros(m, n), zeros(m, n), zeros(m, n), zeros(m, n), sketch, zeros(width, n), Xoshiro(0))
 end
 
-RPCAWorkspace(X::AbstractMatrix; kwargs...) = RPCAWorkspace(size(X)...; kwargs...)
+RPCAWorkspace(X::AbstractMatrix, width::Integer) = RPCAWorkspace(size(X)..., width)
 
-"Soft-thresholding operator, the proximal map of `τ|x|`."
-soft(x, τ) = sign(x) * max(abs(x) - τ, zero(x))
-
-# Given a factorization A = U Σ Vᵀ, write U max(Σ - τ, 0) Vᵀ into dst. Scales U in place.
-function shrink_singular!(dst, U, σ, V, τ)
-    k = count(>(τ), σ)
-    k == 0 && return (fill!(dst, 0.0); 0)
-    Uk = view(U, :, 1:k)
-    Uk .*= transpose(view(σ, 1:k)) .- τ
-    mul!(dst, Uk, adjoint(view(V, :, 1:k)))
-    k
+Base.@kwdef struct PCPOptions
+    tol::Float64 = 1e-7
+    max_iter::Int = 100
+    ρ::Float64 = 1.5
+    exact::Bool = false
 end
 
-"""
-Singular value thresholding `L = D_τ(T)` from a rank-`width` randomized approximation
-`T ≈ Q B` (Halko–Martinsson–Tropp). Only the small `B` is decomposed exactly.
-Returns the number of singular values kept; reaching `width` means the cap is binding.
-"""
-function svt!(ws::RPCAWorkspace, T::AbstractMatrix{Float64}, τ::Real; power_iterations::Integer=1)
-    randomized_range!(ws.range, T, power_iterations, ws.rng)
-    F = golub_reinsch_svd(ws.range.B)
-    k = shrink_singular!(ws.C, F.U, F.S, F.V, τ)
-    mul!(ws.L, ws.range.Q, ws.C)
-    k
+function shrink!(dst::AbstractMatrix{Float64}, F, τ::Real)
+    kept = count(>(τ), F.S)
+    kept == 0 && return (fill!(dst, 0.0); 0)
+    U = view(F.U, :, 1:kept)
+    U .*= transpose(view(F.S, 1:kept)) .- τ
+    mul!(dst, U, adjoint(view(F.V, :, 1:kept)))
+    kept
 end
 
-"Exact singular value thresholding with the full Golub–Reinsch SVD of `T`. Reference path."
-function svt_exact!(ws::RPCAWorkspace, T::AbstractMatrix{Float64}, τ::Real)
-    F = golub_reinsch_svd(T)
-    shrink_singular!(ws.L, F.U, F.S, F.V, τ)
+function svt!(ws::RPCAWorkspace, T::AbstractMatrix{Float64}, τ::Real)
+    randomized_range!(ws.sketch, T, 1, ws.rng)
+    kept = shrink!(ws.core, golub_reinsch_svd(ws.sketch.B), τ)
+    mul!(ws.L, ws.sketch.Q, ws.core)
+    kept
 end
 
-function spectral_norm!(ws::RPCAWorkspace, X)
-    randomized_range!(ws.range, X, 2, ws.rng)
-    first(golub_reinsch_svd(ws.range.B).S)
+svt_exact!(ws::RPCAWorkspace, T::AbstractMatrix{Float64}, τ::Real) = shrink!(ws.L, golub_reinsch_svd(T), τ)
+
+function spectral_norm!(ws::RPCAWorkspace, X::AbstractMatrix{Float64})
+    randomized_range!(ws.sketch, X, 2, ws.rng)
+    first(golub_reinsch_svd(ws.sketch.B).S)
 end
 
-"""
-    rpca!(ws, X; λ, tol, max_iter, ρ, exact, seed) -> iterations
+struct Step
+    μ::Float64
+    μ_next::Float64
+    τ::Float64
+end
 
-Principal component pursuit `min ‖L‖_* + λ‖S‖₁ s.t. L + S = X` by the inexact
-augmented Lagrange multiplier method (Lin, Chen & Ma 2010, Algorithm 5).
-Results are in `ws.L` and `ws.S`; per-iteration rank and relative residual in
-`ws.rank` and `ws.residual`.
-"""
-function rpca!(ws::RPCAWorkspace, X::AbstractMatrix{Float64};
-               λ::Real=1 / sqrt(maximum(size(X))), tol::Real=1e-7,
-               max_iter::Integer=length(ws.rank), ρ::Real=1.5, exact::Bool=false, seed::Integer=0)
-    size(X) == size(ws.L) || throw(DimensionMismatch("workspace does not match X"))
-    max_iter <= length(ws.rank) || throw(ArgumentError("max_iter exceeds workspace history"))
+function update!(ws::RPCAWorkspace, X::AbstractMatrix{Float64}, step::Step)
     (; L, S, Y, T) = ws
-    normF = norm(X)
-    if iszero(normF)                        # X = 0 is solved by L = S = 0; μ = 1.25/‖X‖₂ would be Inf
-        fill!(L, 0.0)
-        fill!(S, 0.0)
-        return 0
+    (; μ, μ_next, τ) = step
+    squares = 0.0
+    @inbounds @simd for i in eachindex(X, L, S, Y, T)
+        x, l, y = X[i], L[i], Y[i]
+        s = soft(x - l + y / μ, τ)
+        z = x - l - s
+        y_next = y + μ * z
+        S[i] = s
+        Y[i] = y_next
+        T[i] = x - s + y_next / μ_next
+        squares += z * z
     end
-    Random.seed!(ws.rng, seed)
+    sqrt(squares)
+end
+
+function zero_solution!(ws::RPCAWorkspace)
+    fill!(ws.L, 0.0)
+    fill!(ws.S, 0.0)
+    (; iterations=0, rank=0, residual=0.0)
+end
+
+function rpca!(ws::RPCAWorkspace, X::AbstractMatrix{Float64}, opts::PCPOptions=PCPOptions())
+    size(X) == size(ws.L) || throw(DimensionMismatch("workspace does not match X"))
+    norm_X = norm(X)
+    isfinite(norm_X) || throw(ArgumentError("X must be finite"))
+    iszero(norm_X) && return zero_solution!(ws)
+    Random.seed!(ws.rng, 0)
     norm2 = spectral_norm!(ws, X)
+    λ = 1 / sqrt(maximum(size(X)))
     μ = 1.25 / norm2
     μ_max = 1e7 * μ
-    Y .= X ./ max(norm2, maximum(abs, X) / λ)
-    fill!(S, 0.0)
-    iterations = 0
-    for k in 1:max_iter
-        T .= X .- S .+ Y ./ μ
-        ws.rank[k] = exact ? svt_exact!(ws, T, 1 / μ) : svt!(ws, T, 1 / μ)
-        S .= soft.(X .- L .+ Y ./ μ, λ / μ)
-        T .= X .- L .- S
-        Y .+= μ .* T
-        μ = min(ρ * μ, μ_max)
-        ws.residual[k] = norm(T) / normF
-        iterations = k
-        ws.residual[k] < tol && break
+    ws.Y .= X ./ max(norm2, maximum(abs, X) / λ)
+    ws.T .= X .+ ws.Y ./ μ
+    rank, residual = 0, Inf
+    for iteration in 1:opts.max_iter
+        rank = opts.exact ? svt_exact!(ws, ws.T, 1 / μ) : svt!(ws, ws.T, 1 / μ)
+        μ_next = min(opts.ρ * μ, μ_max)
+        residual = update!(ws, X, Step(μ, μ_next, λ / μ)) / norm_X
+        μ = μ_next
+        residual < opts.tol && return (; iterations=iteration, rank, residual)
     end
-    iterations
+    (; iterations=opts.max_iter, rank, residual)
 end
 
-"""
-Online robust PCA by stochastic optimization (Feng, Xu & Yan 2013). The nuclear norm is
-replaced by its factored form ‖L‖_* = min ½(‖U‖²_F + ‖V‖²_F), so each frame `x` costs one
-small problem
+Base.@kwdef struct OnlineOptions
+    rank::Int = 5
+    γ::Float64 = 0.999
+    λ₂::Float64 = 1.0
+    tol::Float64 = 1e-4
+    max_inner::Int = 100
+end
 
-    min_{v,s} ½‖x − Uv − s‖² + λ₁/2 ‖v‖² + λ₂‖s‖₁
-
-and the background basis `U` (m×r) is refit from the running sums `A = Σ γᵏ v vᵀ` and
-`B = Σ γᵏ (x − s) vᵀ`. The forgetting factor γ sets the memory to about 1/(1 − γ) frames.
-"""
 struct OnlineRPCA
     U::Matrix{Float64}
     A::Matrix{Float64}
     B::Matrix{Float64}
-    G::Matrix{Float64}        # UᵀU + λ₁I, Cholesky-factored in place each frame
+    gram::Matrix{Float64}
     v::Vector{Float64}
     background::Vector{Float64}
+    work::Vector{Float64}
     λ₁::Float64
     λ₂::Float64
     γ::Float64
+    tol::Float64
+    max_inner::Int
 end
 
-"""
-Start from a converged batch solve in `ws`: with `L ≈ Uₗ Σ Wᵀ` (top `r` triplets),
-`U = Uₗ Σ^½` and per-frame coefficients `Σ^½ Wᵀ`, which makes `A = Σ` and `B = U Σ`.
-"""
-function OnlineRPCA(ws::RPCAWorkspace, r::Integer; λ₁::Real=1 / sqrt(size(ws.L, 1)), λ₂::Real=λ₁, γ::Real=0.999)
-    m = size(ws.L, 1)
-    1 <= r <= size(ws.range.Q, 2) || throw(ArgumentError("rank must be in 1:width"))
-    0 < γ <= 1 || throw(ArgumentError("γ must be in (0, 1]"))
-    randomized_range!(ws.range, ws.L, 1, ws.rng)
-    F = golub_reinsch_svd(ws.range.B)
+function OnlineRPCA(ws::RPCAWorkspace, opts::OnlineOptions)
+    m, r = size(ws.L, 1), opts.rank
+    1 <= r <= size(ws.sketch.Q, 2) || throw(ArgumentError("rank must be in 1:width"))
+    0 < opts.γ <= 1 || throw(ArgumentError("γ must be in (0, 1]"))
+    randomized_range!(ws.sketch, ws.L, 1, ws.rng)
+    F = golub_reinsch_svd(ws.sketch.B)
     σ = F.S[1:r]
-    U = (ws.range.Q * view(F.U, :, 1:r)) .* sqrt.(transpose(σ))
-    OnlineRPCA(U, Matrix(Diagonal(σ)), U .* transpose(σ), zeros(r, r), zeros(r), zeros(m), λ₁, λ₂, γ)
+    U = (ws.sketch.Q * view(F.U, :, 1:r)) .* sqrt.(transpose(σ))
+    λ₁ = 1 / sqrt(m)
+    OnlineRPCA(U, Matrix(Diagonal(σ)), U .* transpose(σ), zeros(r, r), zeros(r), zeros(m), zeros(m),
+               λ₁, opts.λ₂ * λ₁, opts.γ, opts.tol, opts.max_inner)
 end
 
-"""
-Process one frame: write its sparse part into `s` (and its background into
-`o.background`), then update the basis. Allocation-free.
-"""
-function step!(o::OnlineRPCA, s::AbstractVector{Float64}, x::AbstractVector{Float64}; max_inner::Integer=50, tol::Real=1e-6)
-    (; U, A, B, G, v, background, λ₁, λ₂, γ) = o
-    r = length(v)
-    # v-subproblem matrix, factored once: U is fixed while this frame is solved.
-    mul!(G, transpose(U), U)
-    for j in 1:r
-        G[j, j] += λ₁
+function factor_gram!(o::OnlineRPCA)
+    (; U, gram, λ₁) = o
+    @inbounds for j in axes(U, 2), i in 1:j
+        total = 0.0
+        @simd for k in axes(U, 1)
+            total += U[k, i] * U[k, j]
+        end
+        gram[i, j] = i == j ? total + λ₁ : total
     end
-    LAPACK.potrf!('U', G)
-    normx2 = max(sum(abs2, x), eps())
+    LAPACK.potrf!('U', gram)
+end
+
+function fit_coefficients!(o::OnlineRPCA, target::AbstractVector{Float64})
+    mul!(o.v, transpose(o.U), target)
+    LAPACK.potrs!('U', o.gram, o.v)
+    mul!(o.background, o.U, o.v)
+end
+
+function shrink_extrapolate!(o::OnlineRPCA, s::AbstractVector{Float64}, x::AbstractVector{Float64}, β::Float64)
+    (; background, work, λ₂) = o
+    change = 0.0
+    @inbounds @simd for i in eachindex(s, x, background, work)
+        s_new = soft(x[i] - background[i], λ₂)
+        d = s_new - s[i]
+        change += d * d
+        work[i] = s_new + β * d
+        s[i] = s_new
+    end
+    change
+end
+
+function solve_frame!(o::OnlineRPCA, s::AbstractVector{Float64}, x::AbstractVector{Float64}, energy::Float64)
+    stop = o.tol^2 * max(energy, eps())
     fill!(s, 0.0)
-    for _ in 1:max_inner
-        background .= x .- s
-        mul!(v, transpose(U), background)
-        LAPACK.potrs!('U', G, v)                     # v = (UᵀU + λ₁I)⁻¹ Uᵀ(x − s)
-        mul!(background, U, v)
-        change = 0.0
-        @inbounds for i in eachindex(x)
-            new = soft(x[i] - background[i], λ₂)     # s = shrink(x − Uv, λ₂)
-            change += abs2(new - s[i])
-            s[i] = new
-        end
-        change < tol^2 * normx2 && break
+    fill!(o.work, 0.0)
+    momentum = 1.0
+    for iteration in 1:o.max_inner
+        o.background .= x .- o.work
+        fit_coefficients!(o, o.background)
+        momentum_next = (1 + sqrt(1 + 4momentum^2)) / 2
+        change = shrink_extrapolate!(o, s, x, (momentum - 1) / momentum_next)
+        momentum = momentum_next
+        change < stop && return iteration
     end
-    # Discounted sufficient statistics, then one sweep of block coordinate descent on U.
-    @inbounds for k in 1:r, j in 1:r
-        A[j, k] = γ * A[j, k] + v[j] * v[k]
-    end
-    @inbounds for k in 1:r, i in axes(B, 1)
-        B[i, k] = γ * B[i, k] + (x[i] - s[i]) * v[k]
-    end
-    # Exact minimizer of ½tr(Uᵀ(A + λ₁I)U) − tr(UᵀB) over column j, the others fixed:
-    # uⱼ ← uⱼ + (bⱼ − U ãⱼ)/Ãⱼⱼ with Ã = A + λ₁I (Feng, Xu & Yan 2013, Algorithm 2).
-    @inbounds for j in 1:r
-        scale = 1 / (A[j, j] + λ₁)
-        for i in axes(U, 1)
-            Ua = λ₁ * U[i, j]
-            for k in 1:r
-                Ua += U[i, k] * A[k, j]
-            end
-            U[i, j] += (B[i, j] - Ua) * scale
-        end
-    end
-    s
+    o.max_inner
 end
 
-"""
-Random test problem from Candès et al. (2011): `L0 = A Bᵀ` with Gaussian factors of
-rank `r`, `S0` with `density·m·n` entries of ±1 at uniformly random positions.
-"""
-function synthetic(m::Integer, n::Integer, r::Integer, density::Real; rng::AbstractRNG=Xoshiro(1))
+function accumulate!(o::OnlineRPCA)
+    (; A, B, v, work, γ) = o
+    A .= γ .* A .+ v .* transpose(v)
+    for k in eachindex(v)
+        @views B[:, k] .= γ .* B[:, k] .+ v[k] .* work
+    end
+end
+
+function sweep_basis!(o::OnlineRPCA)
+    (; U, A, B, work, λ₁) = o
+    for j in axes(U, 2)
+        mul!(work, U, view(A, :, j))
+        scale = 1 / (A[j, j] + λ₁)
+        @views U[:, j] .+= (B[:, j] .- work .- λ₁ .* U[:, j]) .* scale
+    end
+end
+
+function step!(o::OnlineRPCA, s::AbstractVector{Float64}, x::AbstractVector{Float64})
+    energy = sum(abs2, x)
+    isfinite(energy) || throw(ArgumentError("frame must be finite"))
+    factor_gram!(o)
+    iterations = solve_frame!(o, s, x, energy)
+    o.work .= x .- s
+    fit_coefficients!(o, o.work)
+    accumulate!(o)
+    sweep_basis!(o)
+    iterations
+end
+
+function synthetic(rng::AbstractRNG, shape::NTuple{2,Int}, r::Integer, density::Real)
+    m, n = shape
     L0 = randn(rng, m, r) * randn(rng, r, n) ./ sqrt(m)
     S0 = zeros(m, n)
     for i in randperm(rng, m * n)[1:round(Int, density * m * n)]
@@ -211,7 +233,6 @@ function synthetic(m::Integer, n::Integer, r::Integer, density::Real; rng::Abstr
     L0, S0
 end
 
-"k-th smallest element of `a`, in place (Wirth's selection, Hoare partitioning)."
 function select!(a::AbstractVector, k::Integer)
     lo, hi = firstindex(a), lastindex(a)
     @inbounds while lo < hi
@@ -231,8 +252,7 @@ function select!(a::AbstractVector, k::Integer)
     a[k]
 end
 
-"Per-pixel temporal median of the frames (columns of X), a classic background baseline."
-function median_background!(background::AbstractVector{Float64}, X::AbstractMatrix{Float64}, buffer::Vector{Float64}=Vector{Float64}(undef, size(X, 2)))
+function median_background!(background::AbstractVector{Float64}, X::AbstractMatrix{Float64}, buffer::Vector{Float64})
     middle = cld(size(X, 2), 2)
     @inbounds for i in axes(X, 1)
         copyto!(buffer, view(X, i, :))
@@ -241,84 +261,72 @@ function median_background!(background::AbstractVector{Float64}, X::AbstractMatr
     background
 end
 
-"""
-Separable moving average of radius `r` over each frame (column of `A`, `w × h` pixels,
-row-major), with clamped edges. Smoothing the foreground score before thresholding fills
-the hollow interiors of flat objects; `buffer` holds one frame.
-"""
-function box_filter!(out::AbstractMatrix{Float64}, A::AbstractMatrix{Float64}, dims::NTuple{2,Int}, r::Integer,
-                     buffer::Vector{Float64}=Vector{Float64}(undef, prod(dims)))
-    w, h = dims
-    scale = 1 / (2r + 1)
-    @inbounds for j in axes(A, 2)
-        for y in 1:h, x in 1:w
-            total = 0.0
-            for d in -r:r
-                total += A[(y - 1) * w + clamp(x + d, 1, w), j]
-            end
-            buffer[(y - 1) * w + x] = scale * total
+struct Smoother
+    dims::NTuple{2,Int}
+    out::Vector{Float64}
+    tmp::Vector{Float64}
+end
+
+function Smoother(dims::NTuple{2,Int})
+    dims[1] >= 2 && dims[2] >= 1 || throw(ArgumentError("frames must be at least 2 pixels wide"))
+    Smoother(dims, zeros(prod(dims)), zeros(prod(dims)))
+end
+
+function smooth!(sm::Smoother, residual::AbstractVector{Float64})
+    length(residual) == length(sm.out) || throw(DimensionMismatch("residual does not match the frame size"))
+    w, h = sm.dims
+    (; out, tmp) = sm
+    third = 1 / 3
+    @inbounds for y in 0:h - 1
+        row = y * w
+        tmp[row + 1] = (abs(residual[row + 1]) + abs(residual[row + 1]) + abs(residual[row + 2])) * third
+        @simd for x in 2:w - 1
+            tmp[row + x] = (abs(residual[row + x - 1]) + abs(residual[row + x]) + abs(residual[row + x + 1])) * third
         end
-        for y in 1:h, x in 1:w
-            total = 0.0
-            for d in -r:r
-                total += buffer[(clamp(y + d, 1, h) - 1) * w + x]
-            end
-            out[(y - 1) * w + x, j] = scale * total
+        tmp[row + w] = (abs(residual[row + w - 1]) + abs(residual[row + w]) + abs(residual[row + w])) * third
+    end
+    @inbounds for y in 1:h
+        above, below = (max(y - 1, 1) - 1) * w, (min(y + 1, h) - 1) * w
+        row = (y - 1) * w
+        @simd for x in 1:w
+            out[row + x] = (tmp[above + x] + tmp[row + x] + tmp[below + x]) * third
         end
     end
     out
 end
 
-"""
-Confusion histograms of the detector `score > t` over a sorted threshold grid, against CDnet
-ground truth: 255 = motion is positive, 0 = static and 50 = shadow are negative, 85 = outside
-ROI and 170 = unknown are ignored. Bin `k` counts pixels whose score exceeds
-`thresholds[1:k-1]`, so counts from separate windows simply add.
-"""
 struct PRCounts
-    thresholds::Vector{Float64}
+    step::Float64
     positives::Vector{Int}
     negatives::Vector{Int}
 end
 
-function PRCounts(thresholds::AbstractVector{<:Real})
-    issorted(thresholds) || throw(ArgumentError("thresholds must be sorted"))
-    K = length(thresholds)
-    PRCounts(collect(Float64, thresholds), zeros(Int, K + 1), zeros(Int, K + 1))
-end
+PRCounts(step::Real, bins::Integer) = PRCounts(step, zeros(Int, bins + 1), zeros(Int, bins + 1))
 
-"Add the pixels of `scale · score` to the histograms; one pass, one binary search per pixel."
-function tally!(counts::PRCounts, score::AbstractArray{<:Real}, gt::AbstractArray{UInt8}; scale::Real=1.0)
-    size(score) == size(gt) || throw(DimensionMismatch("score and ground truth differ in size"))
-    (; thresholds, positives, negatives) = counts
+thresholds(counts::PRCounts) = counts.step .* (1:length(counts.positives) - 1)
+
+function tally!(counts::PRCounts, score::AbstractVector{Float64}, gt::AbstractVector{UInt8})
+    length(score) == length(gt) || throw(DimensionMismatch("score and ground truth differ in size"))
+    (; positives, negatives) = counts
+    inverse_step, top = 1 / counts.step, length(positives) - 1
     @inbounds for i in eachindex(score, gt)
         label = gt[i]
         (label == 0x55 || label == 0xaa) && continue
-        bin = searchsortedfirst(thresholds, scale * score[i])
-        label == 0xff ? (positives[bin] += 1) : (negatives[bin] += 1)
+        exceeded = clamp(unsafe_trunc(Int, ceil(score[i] * inverse_step)) - 1, 0, top)
+        label == 0xff ? (positives[exceeded + 1] += 1) : (negatives[exceeded + 1] += 1)
     end
     counts
 end
 
-"Precision, recall and F1 at every threshold of the grid."
 function pr_curve(counts::PRCounts)
-    total = sum(counts.positives)
-    tp = reverse!(cumsum(reverse(counts.positives)))[2:end]   # tp[k]: motion pixels scoring above thresholds[k]
+    tp = reverse!(cumsum(reverse(counts.positives)))[2:end]
     fp = reverse!(cumsum(reverse(counts.negatives)))[2:end]
     precision = @. ifelse(tp + fp == 0, 1.0, tp / (tp + fp))
-    recall = tp ./ max(total, 1)
+    recall = tp ./ max(sum(counts.positives), 1)
     f1 = @. ifelse(precision + recall == 0, 0.0, 2precision * recall / (precision + recall))
     (; precision, recall, f1)
 end
 
-pr_curve(score::AbstractArray{<:Real}, gt::AbstractArray{UInt8}, thresholds::AbstractVector{<:Real}) =
-    pr_curve(tally!(PRCounts(thresholds), score, gt))
-
-"""
-Load `data/<video>` written by `scripts/fetch_cdnet.sh`: 8-bit luma frames as columns
-(kept as bytes so long videos fit; convert one window at a time), ground-truth labels in
-the same layout, and the frame `(width, height)`.
-"""
 function read_video(dir::AbstractString)
     width, height, frames = parse.(Int, split(read(joinpath(dir, "size.txt"), String)))
     bytes = read!(joinpath(dir, "frames.u8"), Matrix{UInt8}(undef, width * height, frames))

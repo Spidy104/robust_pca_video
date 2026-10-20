@@ -1,125 +1,108 @@
-# julia --project=scripts scripts/run.jl synthetic | cdnet <video> | render <video> [frame] | summary | sweep | bench [video]
 using LinearAlgebra
 using Printf
 using Random
 using RobustPCA
-using Statistics
 
 const DATA = joinpath(dirname(@__DIR__), "data")
 const OUT = joinpath(dirname(@__DIR__), "outputs")
-const WINDOW = 200                        # frames per RPCA solve
-const TOL = 1e-3                          # on video, F1 is unchanged below this and iterations halve (README)
-const TAUS = collect(0.005:0.005:0.5)     # threshold on smoothed |residual|, intensity units
-const CALIBRATION = "highway"             # the only video whose ground truth picks thresholds
+const WINDOW = 200
+const STEP, BINS = 0.005, 100
+const CALIBRATION = "highway"
 const METHODS = (:batch_w5, :batch_w20, :online, :median)
-const LABELS = (batch_w5 = "batch RPCA w=5", batch_w20 = "batch RPCA w=20", online = "online RPCA", median = "temporal median")
-const RANK = 5                            # online basis size, = the low batch cap
-const GAMMA = 0.999                       # online forgetting factor: ~1000-frame memory, fixed before testing
+const WIDTHS = (batch_w5=5, batch_w20=20)
+const LABELS = (batch_w5="batch RPCA w=5", batch_w20="batch RPCA w=20", online="online RPCA", median="temporal median")
 const VIDEOS = ("highway" => "none", "backdoor" => "shadows", "boats" => "rippling water",
                 "badminton" => "camera shake", "abandonedBox" => "objects that stop")
+const BATCH = PCPOptions(tol=1e-3)
+const ONLINE = OnlineOptions()
+const SWEEP = ((0.99, 1.0), (0.995, 1.0), (0.999, 1.0), (1.0, 1.0), (0.999, 0.5), (0.999, 2.0), (0.999, 4.0))
 
 relative(A, B) = norm(A - B) / norm(B)
+counts_path(video) = joinpath(OUT, "$(video)_counts.csv")
+new_counts() = PRCounts(STEP, BINS)
+windows(N) = ((lo = min(start, N - WINDOW + 1); (lo:lo + WINDOW - 1, (start - lo + 1):WINDOW)) for start in 1:WINDOW:N)
+function load_clip(video)
+    isdir(joinpath(DATA, video)) || error("no data for $video; run scripts/fetch_cdnet.sh first")
+    read_video(joinpath(DATA, video))
+end
 
-# Phase transition of exact recovery on video-shaped (tall) problems.
 function phase_grid()
-    m, n = 4800, 200
+    shape = (4800, 200)
+    ws = RPCAWorkspace(shape..., 60)
     path = joinpath(OUT, "synthetic.csv")
-    ws = RPCAWorkspace(m, n; width=60)
     open(path, "w") do io
         println(io, "rank,density,iterations,seconds,error_L,error_S")
         @printf("%5s %8s %6s %8s %10s %10s\n", "rank", "density", "iters", "time", "‖ΔL‖/‖L0‖", "‖ΔS‖/‖S0‖")
         for r in (5, 10, 20, 30, 40), density in (0.02, 0.05, 0.1, 0.2, 0.3)
-            L0, S0 = synthetic(m, n, r, density; rng=Xoshiro(r))
+            L0, S0 = synthetic(Xoshiro(r), shape, r, density)
             X = L0 + S0
-            seconds = @elapsed iterations = rpca!(ws, X)
-            eL, eS = relative(ws.L, L0), relative(ws.S, S0)
-            @printf("%5d %8.2f %6d %7.2fs %10.1e %10.1e\n", r, density, iterations, seconds, eL, eS)
-            println(io, join((r, density, iterations, seconds, eL, eS), ","))
+            seconds = @elapsed result = rpca!(ws, X)
+            row = (r, density, result.iterations, seconds, relative(ws.L, L0), relative(ws.S, S0))
+            println(io, join(row, ","))
+            @printf("%5d %8.2f %6d %7.2fs %10.1e %10.1e\n", row...)
         end
     end
     println("wrote ", path)
 end
 
-"""
-Per-window buffers for one detector. Its residual is `S` (RPCA) or `X − median` (baseline);
-its score is the 3×3 box-smoothed |residual|, tallied over the threshold grid `TAUS`.
-"""
-struct Detector
-    residual::Matrix{Float64}
-    score::Matrix{Float64}
-    counts::PRCounts
-end
-Detector(m, n) = Detector(zeros(m, n), zeros(m, n), PRCounts(TAUS))
-
-# Smooth |residual| into `score`; the residual buffer is reused as scratch.
-function score!(d::Detector, dims, frame)
-    d.residual .= abs.(d.residual)
-    box_filter!(d.score, d.residual, dims, 1, frame)
+function save_counts(path, counts)
+    open(path, "w") do io
+        println(io, "threshold,", join(("$(k)_positives,$(k)_negatives" for k in keys(counts)), ","))
+        grid = thresholds(first(counts))
+        for k in eachindex(first(counts).positives)
+            threshold = k <= length(grid) ? @sprintf("%.3f", grid[k]) : "Inf"
+            println(io, threshold, ",", join(("$(c.positives[k]),$(c.negatives[k])" for c in counts), ","))
+        end
+    end
 end
 
-# Windows of WINDOW frames tile the video; the last one slides back to stay full length
-# and scores only frames no earlier window scored.
-windows(N) = ((lo = min(start, N - WINDOW + 1); (lo:lo + WINDOW - 1, (start - lo + 1):WINDOW)) for start in 1:WINDOW:N)
+function load_curves(path)
+    lines = collect(eachline(path))
+    names = Tuple(Symbol.(replace.(split(lines[1], ",")[2:2:end], "_positives" => "")))
+    rows = [split(line, ",")[2:end] for line in lines[2:end]]
+    column(j) = parse.(Int, getindex.(rows, j))
+    curves = (pr_curve(PRCounts(STEP, column(2i - 1), column(2i))) for i in eachindex(names))
+    NamedTuple{names}(Tuple(curves))
+end
 
-# Score every frame once with each method. Batch RPCA solves each window; online RPCA is
-# warm-started from the first window's w=5 solve, then sees each frame once, in order.
-function evaluate(video; γ=GAMMA, path=counts_path(video))
-    bytes, gt, dims = read_video(joinpath(DATA, video))
+function calibrate()
+    isfile(counts_path(CALIBRATION)) || error("run `cdnet $CALIBRATION` first: it calibrates the thresholds")
+    map(curve -> argmax(curve.f1), load_curves(counts_path(CALIBRATION)))
+end
+
+function evaluate(video)
+    bytes, gt, dims = load_clip(video)
     m, N = size(bytes)
     N >= WINDOW || error("$video has $N frames, fewer than one window")
     X = Matrix{Float64}(undef, m, WINDOW)
-    batch = (RPCAWorkspace(X; width=5), RPCAWorkspace(X; width=20))
-    detectors = NamedTuple{METHODS}(ntuple(_ -> Detector(m, WINDOW), length(METHODS)))
+    batch = map(width -> RPCAWorkspace(m, WINDOW, width), WIDTHS)
+    counts = NamedTuple{METHODS}(ntuple(_ -> new_counts(), length(METHODS)))
+    smoother = Smoother(dims)
     online = nothing
-    background, column, frame = zeros(m), zeros(WINDOW), zeros(m)
+    background, column, residual, s = zeros(m), zeros(WINDOW), zeros(m), zeros(m)
     seconds = zeros(3)
-    for (cols, new) in windows(N)
+    for (cols, fresh) in windows(N)
         X .= view(bytes, :, cols) ./ 255
-        for (k, (ws, d)) in enumerate(zip(batch, (detectors.batch_w5, detectors.batch_w20)))
-            seconds[k] += @elapsed rpca!(ws, X; tol=TOL)
-            copy!(d.residual, ws.S)
-        end
-        isnothing(online) && (online = OnlineRPCA(batch[1], RANK; γ))   # once, from the first window
-        seconds[3] += @elapsed for j in new
-            step!(online, view(detectors.online.residual, :, j), view(X, :, j))
-        end
+        seconds[1] += @elapsed rpca!(batch.batch_w5, X, BATCH)
+        seconds[2] += @elapsed rpca!(batch.batch_w20, X, BATCH)
+        isnothing(online) && (online = OnlineRPCA(batch.batch_w5, ONLINE))
         median_background!(background, X, column)
-        detectors.median.residual .= X .- background
-        for d in detectors
-            score!(d, dims, frame)
-            tally!(d.counts, view(d.score, :, new), view(gt, :, cols[new]))
+        for j in fresh
+            truth = view(gt, :, cols[j])
+            for method in keys(batch)
+                tally!(counts[method], smooth!(smoother, view(batch[method].S, :, j)), truth)
+            end
+            seconds[3] += @elapsed step!(online, s, view(X, :, j))
+            tally!(counts.online, smooth!(smoother, s), truth)
+            residual .= view(X, :, j) .- background
+            tally!(counts.median, smooth!(smoother, residual), truth)
         end
     end
     @printf("%s: %d frames of %d×%d; frames/s: batch w=5 %.0f, batch w=20 %.0f, online %.0f\n",
             video, N, dims..., (N ./ seconds)...)
-    save_counts(path, detectors)
+    save_counts(counts_path(video), counts)
 end
 
-counts_path(video) = joinpath(OUT, "$(video)_counts.csv")
-
-function save_counts(path, detectors)
-    open(path, "w") do io
-        println(io, "threshold,", join(("$(k)_positives,$(k)_negatives" for k in keys(detectors)), ","))
-        for k in 1:length(TAUS) + 1
-            t = k <= length(TAUS) ? TAUS[k] : Inf   # last bin: above every threshold
-            println(io, t, ",", join(("$(d.counts.positives[k]),$(d.counts.negatives[k])" for d in detectors), ","))
-        end
-    end
-end
-
-# PR curve per method of a saved run, keyed by method.
-function load_curves(path)
-    lines = collect(eachline(path))
-    names = Symbol.(replace.(split(lines[1], ",")[2:2:end], "_positives" => ""))
-    rows = [parse.(Float64, split(line, ",")) for line in lines[2:end]]
-    column(j) = round.(Int, getindex.(rows, j))
-    NamedTuple{Tuple(names)}(Tuple(pr_curve(PRCounts(TAUS, column(2i), column(2i + 1))) for i in eachindex(names)))
-end
-
-# Grid index of the best F1 on the calibration video, per method.
-calibrate(path=counts_path(CALIBRATION)) = map(curve -> argmax(curve.f1), load_curves(path))
-
-# One τ per method, chosen on the calibration video, applied unchanged to the rest.
 function summary()
     taus = calibrate()
     table = IOBuffer()
@@ -133,42 +116,37 @@ function summary()
         println(table, "| ", video == CALIBRATION ? "$video (calibration)" : video, " | ", stress, " | ", join(cells, " | "), " |")
     end
     println(table, "\nCells: oracle F1 (best τ for that video) / **F1 at the τ calibrated on $CALIBRATION** (precision, recall).")
-    println(table, "Calibrated τ: ", join((@sprintf("%s %.3f", LABELS[k], TAUS[taus[k]]) for k in METHODS), ", "), ".")
+    println(table, "Calibrated τ: ", join((@sprintf("%s %.3f", LABELS[k], STEP * taus[k]) for k in METHODS), ", "), ".")
     text = String(take!(table))
     print(text)
     write(joinpath(OUT, "summary.md"), text)
     println("wrote outputs/summary.md")
 end
 
-# Online settings (γ, λ₂/λ₀) around the defaults, with λ₀ = 1/√m: reported, not tuned.
-# Each setting gets its own τ calibrated on highway, like every other method.
-const SWEEP = ((0.99, 1.0), (0.995, 1.0), (0.999, 1.0), (1.0, 1.0), (0.999, 0.5), (0.999, 2.0), (0.999, 4.0))
+function sweep_video(video)
+    bytes, gt, dims = load_clip(video)
+    m, N = size(bytes)
+    first_window = bytes[:, 1:WINDOW] ./ 255
+    ws = RPCAWorkspace(first_window, WIDTHS.batch_w5)
+    rpca!(ws, first_window, BATCH)
+    models = [OnlineRPCA(ws, OnlineOptions(γ=γ, λ₂=factor)) for (γ, factor) in SWEEP]
+    counts = [new_counts() for _ in SWEEP]
+    smoother = Smoother(dims)
+    x, s = zeros(m), zeros(m)
+    seconds = @elapsed for j in 1:N
+        x .= view(bytes, :, j) ./ 255
+        for (model, histogram) in zip(models, counts)
+            step!(model, s, x)
+            tally!(histogram, smooth!(smoother, s), view(gt, :, j))
+        end
+    end
+    @printf("%s: %d frames × %d settings in %.1f s\n", video, N, length(SWEEP), seconds)
+    pr_curve.(counts)
+end
 
 function online_sweep()
-    curves = Dict{String,Vector}()
-    for (video, _) in VIDEOS
-        bytes, gt, dims = read_video(joinpath(DATA, video))
-        m, N = size(bytes)
-        first_window = bytes[:, 1:WINDOW] ./ 255
-        ws = RPCAWorkspace(first_window; width=5)
-        rpca!(ws, first_window; tol=TOL)
-        models = [OnlineRPCA(ws, RANK; γ, λ₂=factor / sqrt(m)) for (γ, factor) in SWEEP]
-        counts = [PRCounts(TAUS) for _ in SWEEP]
-        x, s, frame = zeros(m), zeros(m), zeros(m)
-        residual, score = zeros(m, 1), zeros(m, 1)
-        seconds = @elapsed for j in 1:N
-            x .= view(bytes, :, j) ./ 255
-            for (o, c) in zip(models, counts)
-                step!(o, s, x)
-                view(residual, :, 1) .= abs.(s)
-                box_filter!(score, residual, dims, 1, frame)
-                tally!(c, score, view(gt, :, j:j))
-            end
-        end
-        curves[video] = pr_curve.(counts)
-        @printf("%s: %d frames × %d settings in %.1f s\n", video, N, length(SWEEP), seconds)
-    end
-    taus = [argmax(curve.f1) for curve in curves[CALIBRATION]]
+    curves = Dict(video => sweep_video(video) for (video, _) in VIDEOS)
+    taus = argmax.(getproperty.(curves[CALIBRATION], :f1))
     table = IOBuffer()
     println(table, "| γ | λ₂/λ₀ | ", join(first.(VIDEOS), " | "), " |")
     println(table, "|---:|---:|", "---:|"^length(VIDEOS))
@@ -176,27 +154,34 @@ function online_sweep()
         cells = (@sprintf("%.3f (%.3f)", curves[video][i].f1[taus[i]], maximum(curves[video][i].f1)) for (video, _) in VIDEOS)
         println(table, "| $γ | $factor | ", join(cells, " | "), " |")
     end
-    println(table, "\nCells: F1 at the τ calibrated on $CALIBRATION (oracle F1). Default: γ = $GAMMA, λ₂/λ₀ = 1.")
+    println(table, "\nCells: F1 at the τ calibrated on $CALIBRATION (oracle F1). Default: γ = $(ONLINE.γ), λ₂/λ₀ = $(ONLINE.λ₂).")
     text = String(take!(table))
     print(text)
     write(joinpath(OUT, "online_sweep.md"), text)
 end
 
-# Stacked rows of input | background L | 4|S| | mask | ground truth, one row per method,
-# streamed into ffmpeg.
-function mosaic(path, X, rows, gt, (w, h); frames=axes(X, 2))
+function threshold_mask(S, smoother, τ)
+    mask = falses(size(S))
+    for j in axes(S, 2)
+        mask[:, j] .= smooth!(smoother, view(S, :, j)) .> τ
+    end
+    mask
+end
+
+function mosaic(path, rows, gt, dims)
+    w, h = dims
     frame = Matrix{UInt8}(undef, 5w, h * length(rows))
-    byte(x) = round(UInt8, clamp(x, 0, 1) * 255)
+    gray(x) = round(UInt8, clamp(x, 0, 1) * 255)
     label(g) = g == 0xff ? 0xff : g == 0x32 ? 0x80 : g == 0x00 ? 0x00 : 0x30
     codec = endswith(path, ".mp4") ? `-c:v libx264 -crf 26 -pix_fmt yuv420p` : ``
     open(`ffmpeg -v error -y -f rawvideo -pix_fmt gray -s $(5w)x$(h * length(rows)) -r 15 -i - -vf 'scale=iw*2:ih*2:flags=neighbor' $codec $path`, "w") do io
-        for j in frames
-            for (row, (L, S, mask)) in enumerate(rows), y in 1:h, x in 1:w
+        for j in axes(gt, 2)
+            for (row, r) in enumerate(rows), y in 1:h, x in 1:w
                 p, Y = (y - 1) * w + x, (row - 1) * h + y
-                frame[x, Y] = byte(X[p, j])
-                frame[w + x, Y] = byte(L[p, j])
-                frame[2w + x, Y] = byte(4abs(S[p, j]))
-                frame[3w + x, Y] = mask[p, j] ? 0xff : 0x00
+                frame[x, Y] = gray(r.input[p, j])
+                frame[w + x, Y] = gray(r.background[p, j])
+                frame[2w + x, Y] = gray(4abs(r.foreground[p, j]))
+                frame[3w + x, Y] = r.mask[p, j] ? 0xff : 0x00
                 frame[4w + x, Y] = label(gt[p, j])
             end
             write(io, frame)
@@ -204,67 +189,84 @@ function mosaic(path, X, rows, gt, (w, h); frames=axes(X, 2))
     end
 end
 
-# The window around `center` (default: the frame with most labelled motion): batch RPCA
-# (w=5) on top, online RPCA below, each masked at its calibrated τ.
-function render(video; center=nothing)
-    bytes, gt, dims = read_video(joinpath(DATA, video))
+column_slice(rows, j) = map(r -> map(M -> view(M, :, j:j), r), rows)
+
+function replay_online(bytes, ws, cols)
+    m = size(bytes, 1)
+    online = OnlineRPCA(ws, ONLINE)
+    L, S = zeros(m, length(cols)), zeros(m, length(cols))
+    x, s = zeros(m), zeros(m)
+    for j in 1:last(cols)
+        x .= view(bytes, :, j) ./ 255
+        step!(online, s, x)
+        j in cols || continue
+        S[:, j - first(cols) + 1] .= s
+        L[:, j - first(cols) + 1] .= online.background
+    end
+    L, S
+end
+
+function render(video, center)
+    bytes, gt, dims = load_clip(video)
     m, N = size(bytes)
-    busiest = something(center, argmax(count(==(0xff), view(gt, :, j)) for j in 1:N))
+    isnothing(center) || 1 <= center <= N || error("frame $center is outside 1:$N")
+    busiest = isnothing(center) ? argmax(count(==(0xff), view(gt, :, j)) for j in 1:N) : center
     name = isnothing(center) ? video : "$(video)_$center"
     lo = clamp(busiest - WINDOW ÷ 2, 1, N - WINDOW + 1)
     cols = lo:lo + WINDOW - 1
     taus = calibrate()
-    mask(S, method) = (d = Detector(m, WINDOW); copy!(d.residual, S); score!(d, dims, zeros(m)) .> TAUS[taus[method]])
+    smoother = Smoother(dims)
 
-    first_window = bytes[:, 1:WINDOW] ./ 255
-    ws = RPCAWorkspace(first_window; width=5)
-    rpca!(ws, first_window; tol=TOL)
-    online = OnlineRPCA(ws, RANK; γ=GAMMA)
-    L, S, x, s = zeros(m, WINDOW), zeros(m, WINDOW), zeros(m), zeros(m)
-    for j in 1:last(cols)                    # online has to see every earlier frame
-        x .= view(bytes, :, j) ./ 255
-        step!(online, s, x)
-        if j >= lo
-            S[:, j - lo + 1] .= s
-            L[:, j - lo + 1] .= online.background
-        end
-    end
+    ws = RPCAWorkspace(m, WINDOW, WIDTHS.batch_w5)
+    rpca!(ws, bytes[:, 1:WINDOW] ./ 255, BATCH)
+    L, S = replay_online(bytes, ws, cols)
     X = bytes[:, cols] ./ 255
-    rpca!(ws, X; tol=TOL)
-    rows = ((ws.L, ws.S, mask(ws.S, :batch_w5)), (L, S, mask(S, :online)))
-    g = gt[:, cols]
-    mosaic(joinpath(OUT, "$name.mp4"), X, rows, g, dims)
-    mosaic(joinpath(OUT, "$name.png"), X, rows, g, dims; frames=busiest - lo + 1:busiest - lo + 1)
+    rpca!(ws, X, BATCH)
+    rows = ((input=X, background=ws.L, foreground=ws.S, mask=threshold_mask(ws.S, smoother, STEP * taus.batch_w5)),
+            (input=X, background=L, foreground=S, mask=threshold_mask(S, smoother, STEP * taus.online)))
+    truth = gt[:, cols]
+    mosaic(joinpath(OUT, "$name.mp4"), rows, truth, dims)
+    j = busiest - lo + 1
+    mosaic(joinpath(OUT, "$name.png"), column_slice(rows, j), truth[:, j:j], dims)
     println("  wrote outputs/$name.mp4 (ROI frames $(first(cols))–$(last(cols))) and $name.png")
 end
 
-# Randomized (several widths) vs exact Golub–Reinsch SVT on the first window of real frames.
-function bench(video="highway")
+function bench_row(X, spec, f1_of)
+    name, width, exact = spec
+    ws = RPCAWorkspace(X, width)
+    rpca!(ws, X, PCPOptions(tol=1e-3, exact=exact, max_iter=2))
+    runs = [@timed(rpca!(ws, X, PCPOptions(tol=1e-3, exact=exact))) for _ in 1:(exact ? 1 : 3)]
+    seconds = sort([r.time for r in runs])[cld(length(runs), 2)]
+    (; name, seconds, bytes=runs[1].bytes, result=runs[1].value, f1=f1_of(ws.S), L=ws.L)
+end
+
+function bench(video)
     BLAS.set_num_threads(1)
-    bytes, labels, dims = read_video(joinpath(DATA, video))
+    bytes, labels, dims = load_clip(video)
     X, gt = bytes[:, 1:WINDOW] ./ 255, labels[:, 1:WINDOW]
-    best_f1(S) = maximum(pr_curve(box_filter!(similar(S), abs.(S), dims, 1), gt, TAUS).f1)
+    smoother = Smoother(dims)
+    function best_f1(S)
+        counts = new_counts()
+        for j in axes(S, 2)
+            tally!(counts, smooth!(smoother, view(S, :, j)), view(gt, :, j))
+        end
+        maximum(pr_curve(counts).f1)
+    end
     report = IOBuffer()
     line(s) = (println(s); println(report, s))
     line(@sprintf("%s, %d×%d, BLAS threads = 1, randomized: median of 3 warm runs, exact: 1 warm run", video, size(X)...))
     line(@sprintf("%-16s %8s %6s %5s %10s %12s %7s %14s", "SVT", "time", "iters", "rank", "alloc", "alloc/iter", "F1", "‖L-L_exact‖/‖L‖"))
-    reference = Matrix{Float64}(undef, 0, 0)   # exact L, computed first
-    for (name, width, exact) in (("exact GR", 40, true), ("randomized w=20", 20, false), ("randomized w=40", 40, false), ("randomized w=80", 80, false))
-        ws = RPCAWorkspace(X; width)
-        rpca!(ws, X; exact, max_iter=2)
-        runs = [@timed(rpca!(ws, X; exact, tol=TOL)) for _ in 1:(exact ? 1 : 3)]
-        iterations = runs[1].value
-        exact && (reference = copy(ws.L))
-        allocated = runs[1].bytes
-        line(@sprintf("%-16s %7.2fs %6d %5d %8.1fMB %10.2fMB %7.3f %14.1e", name, median(r.time for r in runs), iterations,
-                      ws.rank[iterations], allocated / 2^20, allocated / iterations / 2^20, best_f1(ws.S), relative(ws.L, reference)))
+    reference = nothing
+    for spec in (("exact GR", 40, true), ("randomized w=20", 20, false), ("randomized w=40", 40, false), ("randomized w=80", 80, false))
+        row = bench_row(X, spec, best_f1)
+        reference = something(reference, copy(row.L))
+        line(@sprintf("%-16s %7.2fs %6d %5d %8.1fMB %10.2fMB %7.3f %14.1e", row.name, row.seconds, row.result.iterations, row.result.rank,
+                      row.bytes / 2^20, row.bytes / row.result.iterations / 2^20, row.f1, relative(row.L, reference)))
     end
-
-    # Memory must stay flat across repeated solves: no growth in live heap.
-    ws = RPCAWorkspace(X; width=40)
-    rpca!(ws, X; tol=TOL)
+    ws = RPCAWorkspace(X, 40)
+    rpca!(ws, X, BATCH)
     live = map(1:5) do _
-        rpca!(ws, X; tol=TOL)
+        rpca!(ws, X, BATCH)
         GC.gc()
         Base.gc_live_bytes() / 2^20
     end
@@ -278,9 +280,9 @@ if command == "synthetic"
     phase_grid()
 elseif command == "cdnet"
     evaluate(ARGS[2])
-    isfile(counts_path(CALIBRATION)) && render(ARGS[2])
+    isfile(counts_path(CALIBRATION)) && render(ARGS[2], nothing)
 elseif command == "render"
-    render(ARGS[2]; center=length(ARGS) >= 3 ? parse(Int, ARGS[3]) : nothing)
+    render(ARGS[2], length(ARGS) >= 3 ? parse(Int, ARGS[3]) : nothing)
 elseif command == "summary"
     summary()
 elseif command == "sweep"
